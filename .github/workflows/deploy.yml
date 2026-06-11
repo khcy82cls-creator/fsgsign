@@ -4,28 +4,18 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Target environment'
-        required: true
-        default: 'production'
-        type: choice
-        options:
-          - production
 
 env:
   ACR_REGISTRY: fsgsignacr.azurecr.io
-  APP_NAME: fsgsign
   CONTAINER_APP_NAME: ${{ secrets.CONTAINER_APP_NAME }}
-  CONTAINER_APP_ENV: ${{ secrets.CONTAINER_APP_ENV }}
   RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
 
 jobs:
-  build-and-push:
-    name: Build & Push to ACR
+  build-server:
+    name: Build OpenSign Server
     runs-on: ubuntu-latest
     outputs:
-      image-tag: ${{ steps.meta.outputs.version }}
+      server-tag: ${{ steps.meta-server.outputs.version }}
 
     steps:
       - name: Checkout code
@@ -34,39 +24,73 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Azure Container Registry
+      - name: Log in to ACR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.ACR_REGISTRY }}
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
-      - name: Extract Docker metadata
-        id: meta
+      - name: Docker metadata (server)
+        id: meta-server
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.ACR_REGISTRY }}/${{ env.APP_NAME }}
+          images: ${{ env.ACR_REGISTRY }}/fsgsign-server
           tags: |
             type=sha,prefix=,format=short
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push Docker image
+      - name: Build and push server image
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: apps/OpenSignServer/Dockerhubfile
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.ACR_REGISTRY }}/${{ env.APP_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ env.ACR_REGISTRY }}/${{ env.APP_NAME }}:buildcache,mode=max
+          tags: ${{ steps.meta-server.outputs.tags }}
+          labels: ${{ steps.meta-server.outputs.labels }}
 
-  deploy-production:
-    name: Deploy to Azure Container Apps
-    needs: build-and-push
+  build-client:
+    name: Build OpenSign Client
     runs-on: ubuntu-latest
-    environment:
-      name: production
-      url: https://sign.fsglimited.com
+    outputs:
+      client-tag: ${{ steps.meta-client.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Docker metadata (client)
+        id: meta-client
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ACR_REGISTRY }}/fsgsign-client
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push client image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: apps/OpenSign/Dockerhubfile
+          push: true
+          tags: ${{ steps.meta-client.outputs.tags }}
+          labels: ${{ steps.meta-client.outputs.labels }}
+
+  deploy-server:
+    name: Deploy Server to Azure Container Apps
+    needs: build-server
+    runs-on: ubuntu-latest
 
     steps:
       - name: Azure Login
@@ -74,19 +98,17 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Deploy to Azure Container Apps
+      - name: Deploy server to Container Apps
         uses: azure/container-apps-deploy-action@v1
         with:
           acrName: fsgsignacr
           containerAppName: ${{ env.CONTAINER_APP_NAME }}
           resourceGroup: ${{ env.RESOURCE_GROUP }}
-          imageToDeploy: ${{ env.ACR_REGISTRY }}/${{ env.APP_NAME }}:${{ needs.build-and-push.outputs.image-tag }}
+          imageToDeploy: ${{ env.ACR_REGISTRY }}/fsgsign-server:${{ needs.build-server.outputs.server-tag }}
 
-      - name: Verify deployment
+      - name: Show deployment URL
         run: |
-          echo "Deployment complete. Checking container app status..."
           az containerapp show \
             --name "${{ env.CONTAINER_APP_NAME }}" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --query "{name:name,runningStatus:properties.runningStatus,fqdn:properties.configuration.ingress.fqdn}" \
-            -o table
+            --query "properties.configuration.ingress.fqdn" -o tsv
